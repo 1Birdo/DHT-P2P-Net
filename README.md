@@ -1,4 +1,5 @@
 # DHT-P2P-Net
+
 Weird Botnet P2P request from my Email indox
 
 
@@ -9,7 +10,7 @@ I unexpectedly received a random .MD file in my inbox detailing the technical sp
 
 ![image](https://github.com/user-attachments/assets/0599802e-b7c2-4396-a968-91f00f945a14)
 
-
+I'm not hating on the guy im just a bit suspisious. 
 
 # P2P Botnet Technical Specification Document
 
