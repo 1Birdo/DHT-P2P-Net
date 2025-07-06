@@ -14,7 +14,7 @@ I unexpectedly received a random .MD file in my inbox detailing the technical sp
 
 I'm not hating on the guy im just a bit suspisious. 
 
-```mermaid
+```text
 [Bot A] —FIND_NODE—> [Bot B]
 [Bot B] —NODES—> [Bot A]
 [Bot A] —FIND_VALUE—> [Bot C]
