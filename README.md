@@ -14,6 +14,14 @@ I unexpectedly received a random .MD file in my inbox detailing the technical sp
 
 I'm not hating on the guy im just a bit suspisious. 
 
+```mermaid
+[Bot A] —FIND_NODE—> [Bot B]
+[Bot B] —NODES—> [Bot A]
+[Bot A] —FIND_VALUE—> [Bot C]
+[Bot C] —VALUE (Command)—> [Bot A]
+```
+
+The .MD file content :- 
 # P2P Botnet Technical Specification Document
 
 > **Note**: This system is a decentralized botnet. Its core functions include command distribution, attack execution, node concealment and persistence, replay protection, and signature authentication. The network layer uses libp2p + Kademlia DHT to implement a control system that requires no central server.
