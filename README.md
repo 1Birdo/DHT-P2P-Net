@@ -2,9 +2,9 @@
 
 ## Project Overview
 
->This is an experimental peer-to-peer (P2P) networking project that will be developed in the background.
->
->Due to its decentralized nature, the repository will contain minimal files — as each instance acts as both the client and the server.
+This is an experimental peer-to-peer (P2P) networking project that will be developed in the background.
+
+Due to its decentralized nature, the repository will contain minimal files — as each instance acts as both the client and the server.
 
 Unexpected Botnet P2P Request via Email
 
@@ -31,7 +31,7 @@ DHT / Packet Flow Summary:
 
 Original `.MD` File Contents:
 
-* # P2P Botnet Technical Specification Document
+# P2P Botnet Technical Specification Document
 
 > **Note**: This system is a decentralized botnet. Its core functions include command distribution, attack execution, node concealment and persistence, replay protection, and signature authentication. The network layer uses libp2p + Kademlia DHT to implement a control system that requires no central server.
 
@@ -131,6 +131,6 @@ Original `.MD` File Contents:
 - Command signer: Generates signed commands using RSA private key
 - Data viewer: Fetches and parses bot\_stats from DHT
 - Automated delivery: Supports multi-node broadcast
-- Optional: GUI / Web UI for management * 
+- Optional: GUI / Web UI for management 
 
 
