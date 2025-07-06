@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-*"This project has potential. While I'm not deeply experienced with P2P, the core concepts seem manageable, and my focus is on laying down the fundamental logic and structure. It may not reach full completion, but the groundwork should be solid.
+"*This project has potential. While I'm not deeply experienced with P2P, the core concepts seem manageable, and my focus is on laying down the fundamental logic and structure. It may not reach full completion, but the groundwork should be solid.
 
-Feel free to build upon or repurpose this project if you'd like."*
+Feel free to build upon or repurpose this project if you'd like.*"
 
 Due to its decentralized nature, the repository will contain minimal files — as each instance acts as both the client and the server.
 
