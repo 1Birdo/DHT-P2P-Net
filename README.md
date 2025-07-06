@@ -1,31 +1,37 @@
 # DHT-P2P-Net
 
-## This will be a project in the background
+## Project Overview
 
-Weird Botnet P2P request from my Email indox
+>This is an experimental peer-to-peer (P2P) networking project that will be developed in the background.
+>
+>Due to its decentralized nature, the repository will contain minimal files — as each instance acts as both the client and the server.
 
+Unexpected Botnet P2P Request via Email
 
 ![image](https://github.com/user-attachments/assets/99623939-b592-44e9-b4f9-f9fc53421b19)
 
-I unexpectedly received a random .MD file in my inbox detailing the technical specifications for building a botnet architecture. The sender claimed it was a request and even offered between $30k–$100k for the source code. 😕 This repository exists to expose this kind of shady behavior and attempt to build an open-source variant instead, especially since the person stopped replying after several email exchanges asking about requirements he went silent.
-I'm not hating on the guy im just a bit suspisious. 
+Out of the blue, I received a strange `.MD` file in my inbox containing a detailed technical specification for a peer-to-peer botnet architecture. The sender claimed it was a paid request, offering between **$30,000–$100,000** for the full source code. 😕
 
+This repository was created to **expose** this kind of suspicious behavior and to **experiment with an open-source version** of what was described — mostly for research and transparency. After exchanging a few emails to clarify their requirements, the sender eventually went silent.
+
+I'm not here to throw accusations, but the whole situation felt *off* and raised some flags.
 
 ![image](https://github.com/user-attachments/assets/0599802e-b7c2-4396-a968-91f00f945a14)
 
+---
 
+DHT / Packet Flow Summary:
 
-DHT / Packet Flow Summary:-
-```text
-[Bot A] —FIND_NODE—> [Bot B]
-[Bot B] —NODES—> [Bot A]
-[Bot A] —FIND_VALUE—> [Bot C]
+[Bot A] —FIND_NODE—> [Bot B]  
+[Bot B] —NODES—> [Bot A]  
+[Bot A] —FIND_VALUE—> [Bot C]  
 [Bot C] —VALUE (Command)—> [Bot A]
-```
 
+---
 
-The .MD file content :- 
-# P2P Botnet Technical Specification Document
+Original `.MD` File Contents:
+
+* # P2P Botnet Technical Specification Document
 
 > **Note**: This system is a decentralized botnet. Its core functions include command distribution, attack execution, node concealment and persistence, replay protection, and signature authentication. The network layer uses libp2p + Kademlia DHT to implement a control system that requires no central server.
 
@@ -125,6 +131,6 @@ The .MD file content :-
 - Command signer: Generates signed commands using RSA private key
 - Data viewer: Fetches and parses bot\_stats from DHT
 - Automated delivery: Supports multi-node broadcast
-- Optional: GUI / Web UI for management
+- Optional: GUI / Web UI for management * 
 
 
