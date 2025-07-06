@@ -8,18 +8,21 @@ Weird Botnet P2P request from my Email indox
 ![image](https://github.com/user-attachments/assets/99623939-b592-44e9-b4f9-f9fc53421b19)
 
 I unexpectedly received a random .MD file in my inbox detailing the technical specifications for building a botnet architecture. The sender claimed it was a request and even offered between $30k–$100k for the source code. 😕 This repository exists to expose this kind of shady behavior and attempt to build an open-source variant instead, especially since the person stopped replying after several email exchanges asking about requirements he went silent.
+I'm not hating on the guy im just a bit suspisious. 
 
 
 ![image](https://github.com/user-attachments/assets/0599802e-b7c2-4396-a968-91f00f945a14)
 
-I'm not hating on the guy im just a bit suspisious. 
 
+
+DHT / Packet Flow Summary:-
 ```text
 [Bot A] —FIND_NODE—> [Bot B]
 [Bot B] —NODES—> [Bot A]
 [Bot A] —FIND_VALUE—> [Bot C]
 [Bot C] —VALUE (Command)—> [Bot A]
 ```
+
 
 The .MD file content :- 
 # P2P Botnet Technical Specification Document
