@@ -2,8 +2,6 @@
 
 ## Project Overview
 
-This is an experimental peer-to-peer (P2P) networking project that will be developed in the background.
-
 Due to its decentralized nature, the repository will contain minimal files — as each instance acts as both the client and the server.
 
 Unexpected Botnet P2P Request via Email
