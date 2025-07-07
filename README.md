@@ -4,7 +4,7 @@ This only works for Go 1.20.* , Please keep this in mind the spec list and the o
 
 You will also need to host your own bootstrap servers for the P2P to actual work,
 this might get implemented later for each instance to host and server their own 
-in like a change or smth roll a dice to make it distribute more equallythis is for later 
+in like a change or smth roll a dice to make it distribute more equally this is for later.
 
 ## Project Overview
 
