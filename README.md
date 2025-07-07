@@ -1,5 +1,11 @@
 # DHT-P2P-Net
 
+This only works for Go 1.20.* , Please keep this in mind the spec list and the old P2P packages ( go-libp2p ) is used just for Testing.
+
+You will also need to host your own bootstrap servers for the P2P to actual work,
+this might get implemented later for each instance to host and server their own 
+in like a change or smth roll a dice to make it distribute more equallythis is for later 
+
 ## Project Overview
 
 * This project has potential. While I'm not deeply experienced with P2P, the core concepts seem manageable, and my focus is on laying down the fundamental logic and structure. It may not reach full completion, but the groundwork should be solid.
